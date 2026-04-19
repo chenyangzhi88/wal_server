@@ -1,0 +1,84 @@
+WAL Server 设计与实现
+1. 架构需求：
+目标：设计一个高效、分布式的 WAL (Write-Ahead Log) 系统，使用 monoio + thread-per-core 结构。
+目标性能：高并发写入，数据持久化，保证每条数据至少有 3 副本，支持节点故障恢复，保证一致性。
+每个线程管理一个本地 WAL 文件，多个线程组成一个服务。
+2. 关键设计：
+2.1 Shard 与 Replication
+Shard（Stream）模型：每个 stream 作为一个一致性单位，独立的日志流。
+副本管理：每个 stream 至少有 3 副本（leader + 2 followers），由不同机器上的不同线程处理。
+数据复制：leader 写入 WAL，异步将数据复制到 followers，采用 quorum 策略（2/3 或 3/3 确认）。
+2.2 单线程设计
+每个 core 管理多个 shard（stream），独立执行。
+每个线程负责多个 stream，但每个 stream 的所有状态（如 lsn、in-flight entries）由该线程独占。
+2.3 数据路径
+客户端请求路由：客户端请求根据 stream_id 被路由到正确的线程。
+每个线程独立的 I/O 操作，例如本地 WAL 写入，复制给 follower 的日志推送。
+使用 group commit + batch 写入优化性能。
+2.4 WAL 结构
+每个线程的 WAL 是独立的，采用 segment 文件的方式，按 stream_id 将日志记录写入不同文件。
+日志记录格式建议：
+magic / version
+stream_id
+epoch / term
+lsn
+payload_len / payload
+2.5 故障恢复
+leader 重选：采用 epoch / term 控制，保证一致性。
+复制恢复：leader 在故障恢复后根据 follower 的 match_lsn 继续推送缺失日志。
+3. 核心实现步骤：
+3.1 数据结构设计
+StreamReplicaState：存储每个 stream 的当前状态（包括 leader、lsn、commit_lsn 等）。
+WalWriter：每个线程管理一个本地 WAL 文件，负责追加数据、fsync 操作。
+3.2 网络协议设计
+客户端请求：append(stream_id, payload)。
+leader 写入日志：leader 将请求写入本地 WAL 并复制到 follower。
+follower ack：follower 完成日志追加后确认返回。
+leader 确认：leader 收到大多数 follower 确认后更新 commit_lsn。
+3.3 复制协议
+leader 与 follower 之间通过异步 RPC 协议传输日志数据。
+在 leader 上批量写入并发送，确保高效。
+3.4 错误恢复
+WAL 恢复：读取损坏的 WAL 文件，校验记录，恢复 stream_id 与 last_lsn 状态。
+follower 恢复：follower 从 leader 同步丢失的数据。
+3.5 性能优化
+批量写入（batch write）：将多个写入操作合并为一次磁盘写入，减少 IO 操作。
+group commit：多个写入请求合并后，一次性提交和 fsync。
+内存管理：线程内部使用内存缓存，尽量减少磁盘 I/O。
+4. 服务架构
+服务根据 stream_id 进行水平切分，每个 stream_id 对应一个或多个副本。
+每个副本由一个线程管理，该线程负责处理所有的读写请求和复制操作。
+服务集群需要提供一个 Meta Service，管理每个 stream 的 leader、replica 映射。
+5. 阶段性实现计划
+阶段 1：实现单机单线程的本地 WAL 处理，支持记录的写入、校验和恢复。
+阶段 2：实现多线程，每个线程独立管理一组 streams，并支持写入路由和批量写入。
+阶段 3：实现 3 副本的复制机制，leader-follower 模式，支持 quorum ack。
+阶段 4：引入 Meta Service 管理服务的扩缩容、leader 切换等。
+6. 示例代码结构
+src/
+  main.rs
+  config.rs
+  net/
+    client.rs
+    peer.rs
+    codec.rs
+  wal/
+    segment.rs
+    record.rs
+    writer.rs
+    recovery.rs
+  replica/
+    stream_state.rs
+    leader.rs
+    follower.rs
+    replicator.rs
+  runtime/
+    worker.rs
+    router.rs
+  meta/
+    client.rs
+  protocol/
+    types.rs
+7. 下一步
+请实现数据结构和 I/O 操作模块，并在本地实现基本的 WAL 写入功能。
+支持分布式写入和日志复制的基本流程。

@@ -16,6 +16,14 @@ struct Cli {
     #[arg(long)]
     listen: Option<String>,
 
+    /// Override raft listen address
+    #[arg(long)]
+    raft_listen: Option<String>,
+
+    /// Override raft node id
+    #[arg(long)]
+    node_id: Option<u64>,
+
     /// Override number of shards
     #[arg(long)]
     shards: Option<usize>,
@@ -51,11 +59,24 @@ fn main() {
     if let Some(addr) = cli.listen {
         config.listen_addr = addr;
     }
+    if let Some(addr) = cli.raft_listen {
+        config.raft_listen_addr = addr;
+    }
+    if let Some(node_id) = cli.node_id {
+        config.node_id = node_id;
+    }
     if let Some(shards) = cli.shards {
         config.num_shards = Some(shards);
     }
     if let Some(dir) = cli.data_dir {
         config.data_dir = dir;
+    }
+
+    // Current milestone: force single Raft group until multi-group routing/placement
+    // and inter-group replication semantics are implemented.
+    if config.num_shards != Some(1) {
+        tracing::info!("forcing single Raft group mode with one shard");
+        config.num_shards = Some(1);
     }
 
     // Detect NUMA topology

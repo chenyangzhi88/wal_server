@@ -15,6 +15,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
+raft = "0.7"
+protobuf = "2.28"
+slog = "2"
 
 [profile.release]
 opt-level = 3

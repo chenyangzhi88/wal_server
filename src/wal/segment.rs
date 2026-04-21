@@ -69,7 +69,9 @@ pub fn decode_segment_header(hdr: &[u8; 64]) -> Result<(u16, u64, u64), SegmentE
         return Err(SegmentError::BadVersion(version));
     }
     let shard_id = u16::from_be_bytes([hdr[5], hdr[6]]);
-    let segment_id = u64::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15]]);
+    let segment_id = u64::from_be_bytes([
+        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+    ]);
     let created_ts_ns = u64::from_be_bytes([
         hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
     ]);
@@ -94,6 +96,10 @@ pub fn list_segments(dir: &Path, shard_id: u16) -> std::io::Result<Vec<(u64, Pat
     }
     segments.sort_by_key(|(lsn, _)| *lsn);
     Ok(segments)
+}
+
+pub fn remove_segment_file(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::index::LsnIndex;
+use super::index::StreamLogIndex;
 use super::record::WalRecord;
 use super::segment::list_segments;
 
@@ -42,13 +42,16 @@ impl WalReader {
         }
     }
 
-    /// Read a record by LSN using the index.
-    pub async fn read_by_lsn(
+    /// Read a record by stream-local LSN using the index.
+    pub async fn read_record(
         &mut self,
-        lsn: u64,
-        index: &LsnIndex,
+        stream_id: u64,
+        stream_lsn: u64,
+        index: &StreamLogIndex,
     ) -> Result<WalRecord, WalReaderError> {
-        let loc = index.lookup(lsn).ok_or(WalReaderError::NotFound(lsn))?;
+        let loc = index
+            .lookup(stream_id, stream_lsn)
+            .ok_or(WalReaderError::NotFound(stream_lsn))?;
         let loc = *loc;
 
         let file = self.get_or_open_segment(loc.segment_id).await?;

@@ -2,7 +2,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use wal_server::shard::stream_state::derive_stream_id;
 use wal_server::wal::reader::WalReader;
 use wal_server::wal::writer::WalWriter;
 
@@ -60,16 +59,15 @@ fn populate(dir: &Path, records: usize, payload_size: usize, segment_bytes: u64)
         .build()
         .expect("runtime");
     rt.block_on(async {
-        let (mut writer, _index, _streams) = WalWriter::open(0, dir, segment_bytes)
+        let (mut writer, _index, _streams) = WalWriter::open(0, dir, segment_bytes, 32, None, 0)
             .await
             .expect("open writer");
-        let key = vec![b's'; 24];
         let value = vec![b'v'; payload_size];
-        let stream_id = derive_stream_id(&key);
+        let stream_id = 7;
 
         for stream_lsn in 0..records as u64 {
             writer
-                .append(stream_id, 1, stream_lsn, &key, &value)
+                .append(stream_id, 1, stream_lsn, &value)
                 .await
                 .expect("append");
         }
@@ -80,9 +78,8 @@ fn populate(dir: &Path, records: usize, payload_size: usize, segment_bytes: u64)
 fn run_append_sync(records: usize, payload_size: usize, segment_bytes: u64) {
     let root = unique_temp_dir("wal_bench_append");
     let shard_dir = root.join("shard_0000");
-    let key = vec![b'k'; 24];
     let value = vec![b'v'; payload_size];
-    let bytes_written = records * (key.len() + value.len());
+    let bytes_written = records * value.len();
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .enable_timer()
@@ -90,13 +87,14 @@ fn run_append_sync(records: usize, payload_size: usize, segment_bytes: u64) {
         .expect("runtime");
     let start = Instant::now();
     rt.block_on(async {
-        let (mut writer, _index, _streams) = WalWriter::open(0, &shard_dir, segment_bytes)
-            .await
-            .expect("open writer");
-        let stream_id = derive_stream_id(&key);
+        let (mut writer, _index, _streams) =
+            WalWriter::open(0, &shard_dir, segment_bytes, 32, None, 0)
+                .await
+                .expect("open writer");
+        let stream_id = 7;
         for stream_lsn in 0..records as u64 {
             writer
-                .append(stream_id, 1, stream_lsn, &key, &value)
+                .append(stream_id, 1, stream_lsn, &value)
                 .await
                 .expect("append");
         }
@@ -130,7 +128,7 @@ fn run_recovery(records: usize, payload_size: usize, segment_bytes: u64) {
         .expect("runtime");
     let start = Instant::now();
     let (writer, index, streams) = rt
-        .block_on(async { WalWriter::open(0, &shard_dir, segment_bytes).await })
+        .block_on(async { WalWriter::open(0, &shard_dir, segment_bytes, 32, None, 0).await })
         .expect("recover");
     let elapsed = start.elapsed();
 
@@ -161,21 +159,22 @@ fn run_point_read(records: usize, payload_size: usize, segment_bytes: u64) {
         .build()
         .expect("runtime");
     let (_writer, index, _streams) = rt
-        .block_on(async { WalWriter::open(0, &shard_dir, segment_bytes).await })
+        .block_on(async { WalWriter::open(0, &shard_dir, segment_bytes, 32, None, 0).await })
         .expect("recover");
     let mut reader = WalReader::new(0, &shard_dir);
+    let stream_id = 7;
     let target = (records / 2) as u64;
 
     let start = Instant::now();
     let record = rt
-        .block_on(async { reader.read_by_lsn(target, &index).await })
+        .block_on(async { reader.read_record(stream_id, target, &index).await })
         .expect("point read");
     let elapsed = start.elapsed();
 
     println!(
         "point-read: target={} payload={}B stream_id={} stream_lsn={} entry_id={}",
         target,
-        record.value.len(),
+        record.payload.len(),
         record.stream_id,
         record.stream_lsn,
         record.entry_id

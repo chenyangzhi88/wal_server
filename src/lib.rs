@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod net;
 pub mod numa;
 pub mod protocol;
+pub mod raft;
 pub mod server;
 pub mod shard;
 pub mod wal;

@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use super::index::{LsnIndex, RecordLocation};
+use super::index::{RecordLocation, StreamLogIndex};
 use super::record::{current_time_ns, WalRecord};
 use super::segment::{
-    decode_segment_header, encode_segment_header, list_segments, segment_filename, SEGMENT_HEADER_SIZE,
+    decode_segment_header, encode_segment_header, list_segments, segment_filename,
+    SEGMENT_HEADER_SIZE,
 };
 use crate::shard::stream_state::StreamStateTable;
 
@@ -35,8 +36,12 @@ impl From<std::io::Error> for WalWriterError {
 pub struct PendingWrite {
     pub connection_id: u64,
     pub stream_id: u64,
-    pub entry_id: u64,
+    pub epoch: u64,
+    pub log_index: u64,
+    pub raft_term: u64,
     pub stream_lsn: u64,
+    pub location: RecordLocation,
+    pub payload: bytes::Bytes,
 }
 
 /// Async WAL writer using monoio file operations.
@@ -65,15 +70,22 @@ impl WalWriter {
         shard_id: u16,
         data_dir: &Path,
         max_segment_bytes: u64,
-    ) -> Result<(Self, LsnIndex, StreamStateTable), WalWriterError> {
+        tail_cache_entries: usize,
+        recovered_streams: Option<StreamStateTable>,
+        replay_from_entry_id_exclusive: u64,
+    ) -> Result<(Self, StreamLogIndex, StreamStateTable), WalWriterError> {
         std::fs::create_dir_all(data_dir).map_err(WalWriterError::Io)?;
 
-        let mut index = LsnIndex::new();
-        let mut streams = StreamStateTable::new();
+        let mut index = StreamLogIndex::new();
+        let mut streams =
+            recovered_streams.unwrap_or_else(|| StreamStateTable::new(tail_cache_entries));
         let segments = list_segments(data_dir, shard_id).map_err(WalWriterError::Io)?;
 
         let mut next_entry_id: u64 = 0;
-        let mut next_segment_id: u64 = segments.last().map(|(segment_id, _)| *segment_id + 1).unwrap_or(0);
+        let mut next_segment_id: u64 = segments
+            .last()
+            .map(|(segment_id, _)| *segment_id + 1)
+            .unwrap_or(0);
 
         // Replay existing segments to rebuild index
         for (segment_id, path) in &segments {
@@ -89,22 +101,26 @@ impl WalWriter {
             while offset < data.len() {
                 match WalRecord::decode(&data[offset..]) {
                     Ok((record, consumed)) => {
+                        if record.entry_id >= next_entry_id {
+                            next_entry_id = record.entry_id + 1;
+                        }
                         index.insert(
-                            record.entry_id,
+                            record.stream_id,
+                            record.stream_lsn,
                             RecordLocation {
                                 segment_id: *segment_id,
                                 offset: offset as u64,
                                 size: consumed as u32,
                             },
                         );
-                        streams.observe_recovered(
-                            record.stream_id,
-                            record.term,
-                            record.entry_id,
-                            record.stream_lsn,
-                        );
-                        if record.entry_id >= next_entry_id {
-                            next_entry_id = record.entry_id + 1;
+                        if record.entry_id > replay_from_entry_id_exclusive {
+                            streams.observe_recovered(
+                                record.stream_id,
+                                record.epoch,
+                                record.entry_id,
+                                record.stream_lsn,
+                                record.payload.clone(),
+                            );
                         }
                         offset += consumed;
                     }
@@ -152,22 +168,34 @@ impl WalWriter {
     pub async fn append(
         &mut self,
         stream_id: u64,
-        term: u64,
+        epoch: u64,
         stream_lsn: u64,
-        key: &[u8],
-        value: &[u8],
+        payload: &[u8],
     ) -> Result<(u64, RecordLocation), WalWriterError> {
         let entry_id = self.next_entry_id;
         self.next_entry_id += 1;
+        self.append_with_log_index(stream_id, epoch, stream_lsn, entry_id, 1, payload)
+            .await
+    }
+
+    pub async fn append_with_log_index(
+        &mut self,
+        stream_id: u64,
+        epoch: u64,
+        stream_lsn: u64,
+        entry_id: u64,
+        _raft_term: u64,
+        payload: &[u8],
+    ) -> Result<(u64, RecordLocation), WalWriterError> {
+        self.next_entry_id = self.next_entry_id.max(entry_id + 1);
 
         let record = WalRecord {
             stream_id,
-            term,
+            epoch,
             entry_id,
             stream_lsn,
             timestamp_ns: current_time_ns(),
-            key: bytes::Bytes::copy_from_slice(key),
-            value: bytes::Bytes::copy_from_slice(value),
+            payload: bytes::Bytes::copy_from_slice(payload),
         };
 
         let data = record.encode_to_vec();
@@ -195,15 +223,26 @@ impl WalWriter {
 
     /// fdatasync the current segment via io_uring.
     pub async fn sync(&self) -> Result<(), WalWriterError> {
-        self.current_file.sync_data().await.map_err(WalWriterError::Io)
+        self.current_file
+            .sync_data()
+            .await
+            .map_err(WalWriterError::Io)
     }
 
     pub fn current_segment_id(&self) -> u64 {
         self.current_segment_id
     }
 
+    pub fn current_data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub fn next_entry_id(&self) -> u64 {
         self.next_entry_id
+    }
+
+    pub fn last_entry_id(&self) -> Option<u64> {
+        self.next_entry_id.checked_sub(1)
     }
 
     /// Rotate to a new segment.
@@ -285,13 +324,16 @@ mod tests {
             .build()
             .expect("runtime");
         rt.block_on(async {
-            let (mut writer, _index, mut streams) = WalWriter::open(1, &shard_dir, 1024).await.unwrap();
+            let (mut writer, _index, mut streams) =
+                WalWriter::open(1, &shard_dir, 1024, 8, None, 0)
+                    .await
+                    .unwrap();
 
             let stream_id = 42;
-            let (entry0, loc0) = writer.append(stream_id, 3, 0, b"alpha", b"one").await.unwrap();
-            streams.mark_appended(stream_id, entry0, 0, 3);
-            let (entry1, _loc1) = writer.append(stream_id, 3, 1, b"alpha", b"two").await.unwrap();
-            streams.mark_appended(stream_id, entry1, 1, 3);
+            let (entry0, loc0) = writer.append(stream_id, 3, 0, b"one").await.unwrap();
+            streams.mark_appended(stream_id, 3, entry0, 0, bytes::Bytes::from_static(b"one"));
+            let (entry1, _loc1) = writer.append(stream_id, 3, 1, b"two").await.unwrap();
+            streams.mark_appended(stream_id, 3, entry1, 1, bytes::Bytes::from_static(b"two"));
             writer.sync().await.unwrap();
 
             assert_eq!(entry0, 0);
@@ -304,17 +346,19 @@ mod tests {
             .build()
             .expect("runtime");
         rt.block_on(async {
-            let (_writer, index, streams) = WalWriter::open(1, &shard_dir, 1024).await.unwrap();
-            assert_eq!(index.max_lsn(), Some(1));
+            let (_writer, index, streams) = WalWriter::open(1, &shard_dir, 1024, 8, None, 0)
+                .await
+                .unwrap();
+            assert_eq!(index.stream_len(42), 2);
             assert_eq!(streams.len(), 1);
 
             let mut reader = WalReader::new(1, &shard_dir);
-            let record = reader.read_by_lsn(1, &index).await.unwrap();
+            let record = reader.read_record(42, 1, &index).await.unwrap();
             assert_eq!(record.stream_id, 42);
-            assert_eq!(record.term, 3);
+            assert_eq!(record.epoch, 3);
             assert_eq!(record.entry_id, 1);
             assert_eq!(record.stream_lsn, 1);
-            assert_eq!(record.value.as_ref(), b"two");
+            assert_eq!(record.payload.as_ref(), b"two");
         });
 
         remove_temp_dir(&root);

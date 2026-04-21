@@ -74,7 +74,9 @@ impl Acceptor {
 
                     // Create a response queue for this connection
                     let resp_queue: ResponseSender = Rc::new(RefCell::new(Vec::new()));
-                    response_map.borrow_mut().insert(conn_id, resp_queue.clone());
+                    response_map
+                        .borrow_mut()
+                        .insert(conn_id, resp_queue.clone());
 
                     let shard_txs = self.shard_txs.clone();
                     let request_eventfds = self.request_eventfds.clone();
@@ -127,18 +129,24 @@ async fn handle_connection(
             }
         }
 
-        // Read data from socket. monoio takes ownership of the buffer and returns it.
+        // Responses are delivered out-of-band from shard threads, so avoid blocking
+        // indefinitely on socket reads; periodically return to flush response queues.
         let read_buf = vec![0u8; 4096];
-        let (res, read_buf) = stream.read(read_buf).await;
-
-        match res {
-            Ok(0) => return, // EOF
-            Ok(n) => {
-                parse_buf.extend_from_slice(&read_buf[..n]);
+        monoio::select! {
+            (res, read_buf) = stream.read(read_buf) => {
+                match res {
+                    Ok(0) => return, // EOF
+                    Ok(n) => {
+                        parse_buf.extend_from_slice(&read_buf[..n]);
+                    }
+                    Err(e) => {
+                        tracing::debug!(conn_id, "read error: {e}");
+                        return;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::debug!(conn_id, "read error: {e}");
-                return;
+            _ = monoio::time::sleep(Duration::from_micros(100)) => {
+                continue;
             }
         }
 
@@ -146,7 +154,7 @@ async fn handle_connection(
         loop {
             match decode_request(&parse_buf) {
                 Ok(Some((req, consumed))) => {
-                    let shard_id = router.route(&req.key);
+                    let shard_id = router.route_stream(req.stream_id);
                     let shard_req = ShardRequest {
                         connection_id: conn_id,
                         request: req,
@@ -157,7 +165,9 @@ async fn handle_connection(
                     } else {
                         let resp = encode_response(&Response {
                             status: Status::ErrShardUnavailable,
-                            lsn: 0,
+                            epoch: 0,
+                            offset: 0,
+                            payload: bytes::Bytes::new(),
                         });
                         let (res, _) = stream.write_all(resp.to_vec()).await;
                         if res.is_err() {

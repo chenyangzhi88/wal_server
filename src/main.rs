@@ -72,13 +72,6 @@ fn main() {
         config.data_dir = dir;
     }
 
-    // Current milestone: force single Raft group until multi-group routing/placement
-    // and inter-group replication semantics are implemented.
-    if config.num_shards != Some(1) {
-        tracing::info!("forcing single Raft group mode with one shard");
-        config.num_shards = Some(1);
-    }
-
     // Detect NUMA topology
     let topology = if config.numa_aware {
         NumaTopology::detect().unwrap_or_else(|e| {

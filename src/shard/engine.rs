@@ -22,6 +22,7 @@ use crate::wal::writer::WalWriter;
 
 struct PendingClientWrite {
     connection_id: u64,
+    stream_id: u64,
     epoch: u64,
     stream_lsn: u64,
 }
@@ -222,6 +223,7 @@ impl ShardEngine {
                     request_id,
                     PendingClientWrite {
                         connection_id: req.connection_id,
+                        stream_id: cmd.stream_id,
                         epoch: cmd.epoch,
                         stream_lsn: cmd.stream_lsn,
                     },
@@ -340,8 +342,9 @@ impl ShardEngine {
             self.raft.mut_store().append(ready.entries())?;
         }
 
-        self.dispatch_raft_messages(ready.take_messages())?;
-        self.dispatch_raft_messages(ready.take_persisted_messages())?;
+        self.dispatch_raft_messages(ready.take_messages()).await?;
+        self.dispatch_raft_messages(ready.take_persisted_messages())
+            .await?;
 
         for entry in committed_entries {
             if entry.get_data().is_empty() {
@@ -356,11 +359,12 @@ impl ShardEngine {
         }
 
         let light_ready = self.raft.advance(ready);
-        self.dispatch_raft_messages(light_ready.messages().to_vec())?;
+        self.dispatch_raft_messages(light_ready.messages().to_vec())
+            .await?;
         Ok(())
     }
 
-    fn dispatch_raft_messages(
+    async fn dispatch_raft_messages(
         &mut self,
         messages: Vec<raft::eraftpb::Message>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -368,10 +372,32 @@ impl ShardEngine {
             if msg.to == self.node_id {
                 self.raft.step(msg)?;
             } else {
-                let _ = self.raft_outbound_tx.try_send(RaftOutbound {
+                let mut outbound = RaftOutbound {
+                    group_id: self.shard_id,
                     target_id: msg.to,
                     message: msg,
-                });
+                };
+                loop {
+                    match self.raft_outbound_tx.try_send(outbound) {
+                        Ok(()) => break,
+                        Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                            outbound = returned;
+                            tracing::warn!(
+                                node_id = self.node_id,
+                                target_id = outbound.target_id,
+                                "raft outbound queue full, retrying"
+                            );
+                            monoio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                            return Err(format!(
+                                "raft outbound queue disconnected for target {}",
+                                returned.target_id
+                            )
+                            .into());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -471,6 +497,9 @@ impl ShardEngine {
         let role = self.raft.raft.state;
         let leader_id = self.raft.raft.leader_id;
         if role != self.observed_role || leader_id != self.observed_leader_id {
+            if self.observed_role == StateRole::Leader && role != StateRole::Leader {
+                self.fail_pending_writes_not_leader();
+            }
             tracing::info!(
                 node_id = self.node_id,
                 ?role,
@@ -482,6 +511,36 @@ impl ShardEngine {
             );
             self.observed_role = role;
             self.observed_leader_id = leader_id;
+        }
+    }
+
+    fn fail_pending_writes_not_leader(&mut self) {
+        if self.pending_writes.is_empty() {
+            return;
+        }
+
+        let mut pending = self
+            .pending_writes
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect::<Vec<_>>();
+        pending.sort_by(|a, b| {
+            a.stream_id
+                .cmp(&b.stream_id)
+                .then_with(|| b.stream_lsn.cmp(&a.stream_lsn))
+        });
+
+        let leader_id = self.raft.raft.leader_id;
+        for pending in pending {
+            self.streams
+                .rollback_uncommitted_append(pending.stream_id, pending.stream_lsn);
+            let _ = self.send_response(
+                pending.connection_id,
+                Status::ErrNotLeader,
+                pending.epoch,
+                leader_id,
+                bytes::Bytes::new(),
+            );
         }
     }
 

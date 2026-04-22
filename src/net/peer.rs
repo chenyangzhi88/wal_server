@@ -13,25 +13,25 @@ use crate::config::PeerConfig;
 pub struct PeerTransport {
     listener: TcpListener,
     peers: HashMap<u64, String>,
-    raft_tx: crossbeam_channel::Sender<RaftInbound>,
-    raft_eventfd: i32,
-    outbound_rx: crossbeam_channel::Receiver<RaftOutbound>,
+    raft_txs: HashMap<u16, crossbeam_channel::Sender<RaftInbound>>,
+    raft_eventfds: HashMap<u16, i32>,
+    outbound_rxs: Vec<crossbeam_channel::Receiver<RaftOutbound>>,
 }
 
 impl PeerTransport {
     pub fn new(
         listener: TcpListener,
         peers: Vec<PeerConfig>,
-        raft_tx: crossbeam_channel::Sender<RaftInbound>,
-        raft_eventfd: i32,
-        outbound_rx: crossbeam_channel::Receiver<RaftOutbound>,
+        raft_txs: HashMap<u16, crossbeam_channel::Sender<RaftInbound>>,
+        raft_eventfds: HashMap<u16, i32>,
+        outbound_rxs: Vec<crossbeam_channel::Receiver<RaftOutbound>>,
     ) -> Self {
         Self {
             listener,
             peers: peers.into_iter().map(|p| (p.id, p.addr)).collect(),
-            raft_tx,
-            raft_eventfd,
-            outbound_rx,
+            raft_txs,
+            raft_eventfds,
+            outbound_rxs,
         }
     }
 
@@ -39,20 +39,21 @@ impl PeerTransport {
         let PeerTransport {
             listener,
             peers,
-            raft_tx,
-            raft_eventfd,
-            outbound_rx,
+            raft_txs,
+            raft_eventfds,
+            outbound_rxs,
         } = self;
 
-        let inbound_tx = raft_tx.clone();
-        let inbound_eventfd = raft_eventfd;
+        let inbound_txs = raft_txs.clone();
+        let inbound_eventfds = raft_eventfds.clone();
         monoio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let tx = inbound_tx.clone();
+                        let txs = inbound_txs.clone();
+                        let eventfds = inbound_eventfds.clone();
                         monoio::spawn(async move {
-                            handle_inbound(stream, tx, inbound_eventfd).await;
+                            handle_inbound(stream, txs, eventfds).await;
                         });
                     }
                     Err(e) => tracing::error!("peer accept error: {e}"),
@@ -70,19 +71,39 @@ impl PeerTransport {
         }
 
         loop {
-            match outbound_rx.try_recv() {
-                Ok(outbound) => {
-                    let target_id = outbound.target_id;
-                    if let Some(tx) = peer_queues.get(&target_id) {
-                        if tx.send(outbound).is_err() {
-                            tracing::warn!(target_id, "peer sender stopped");
+            let mut any_work = false;
+            for outbound_rx in &outbound_rxs {
+                match outbound_rx.try_recv() {
+                    Ok(outbound) => {
+                        any_work = true;
+                        let target_id = outbound.target_id;
+                        if let Some(tx) = peer_queues.get(&target_id) {
+                            let mut outbound = outbound;
+                            loop {
+                                match tx.try_send(outbound) {
+                                    Ok(()) => break,
+                                    Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                                        outbound = returned;
+                                        tracing::warn!(
+                                            target_id,
+                                            "peer sender queue full, retrying"
+                                        );
+                                        monoio::time::sleep(Duration::from_millis(1)).await;
+                                    }
+                                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                        tracing::warn!(target_id, "peer sender stopped");
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {}
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    monoio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
+            if !any_work {
+                monoio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
@@ -124,7 +145,7 @@ async fn run_peer_sender(addr: String, rx: Receiver<RaftOutbound>) {
         let mut frames = Vec::new();
         let mut encode_failed = false;
         for outbound in batch {
-            match encode_raft_message(&outbound.message) {
+            match encode_raft_message(outbound.group_id, &outbound.message) {
                 Ok(frame) => frames.extend_from_slice(&frame),
                 Err(e) => {
                     tracing::warn!("raft outbound encode failed: {e}");
@@ -151,8 +172,8 @@ async fn run_peer_sender(addr: String, rx: Receiver<RaftOutbound>) {
 
 async fn handle_inbound(
     mut stream: TcpStream,
-    raft_tx: crossbeam_channel::Sender<RaftInbound>,
-    raft_eventfd: i32,
+    raft_txs: HashMap<u16, crossbeam_channel::Sender<RaftInbound>>,
+    raft_eventfds: HashMap<u16, i32>,
 ) {
     let mut parse_buf = Vec::with_capacity(8192);
 
@@ -167,9 +188,31 @@ async fn handle_inbound(
 
         loop {
             match try_decode_raft_message(&parse_buf) {
-                Ok(Some((message, consumed))) => {
-                    if raft_tx.try_send(RaftInbound { message }).is_ok() {
-                        notify_eventfd(raft_eventfd);
+                Ok(Some((group_id, message, consumed))) => {
+                    let Some(raft_tx) = raft_txs.get(&group_id) else {
+                        tracing::warn!(group_id, "dropping raft frame for unknown group");
+                        parse_buf.drain(..consumed);
+                        continue;
+                    };
+                    let Some(&raft_eventfd) = raft_eventfds.get(&group_id) else {
+                        tracing::warn!(group_id, "missing eventfd for raft group");
+                        parse_buf.drain(..consumed);
+                        continue;
+                    };
+                    let mut inbound = RaftInbound { group_id, message };
+                    loop {
+                        match raft_tx.try_send(inbound) {
+                            Ok(()) => {
+                                notify_eventfd(raft_eventfd);
+                                break;
+                            }
+                            Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                                inbound = returned;
+                                tracing::warn!(group_id, "raft inbound queue full, retrying");
+                                monoio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
+                        }
                     }
                     parse_buf.drain(..consumed);
                 }

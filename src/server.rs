@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::thread;
 
 use crate::channel::ShardMailbox;
@@ -86,11 +87,19 @@ pub fn start(config: ServerConfig, placement: ShardPlacement) {
         shard_handles.push(handle);
     }
 
-    // Spawn acceptor thread(s) — one per NUMA node
+    // Current runtime owns a single client listener and a single raft listener.
+    // Multi-listener NUMA fanout needs SO_REUSEPORT and per-listener balancing.
     let mut acceptor_handles = Vec::new();
     let mut peer_handles = Vec::new();
 
-    for &acceptor_cpu in &placement.acceptor_cpus {
+    if placement.acceptor_cpus.len() > 1 {
+        tracing::warn!(
+            acceptor_cpus = ?placement.acceptor_cpus,
+            "multiple acceptor CPUs available but SO_REUSEPORT is not implemented; starting a single listener"
+        );
+    }
+
+    if let Some(&acceptor_cpu) = placement.acceptor_cpus.first() {
         let listen_addr = config.listen_addr.clone();
         let num_shards = num_shards as u16;
         let txs = shard_txs.clone();
@@ -124,12 +133,22 @@ pub fn start(config: ServerConfig, placement: ShardPlacement) {
         acceptor_handles.push(handle);
     }
 
-    for &acceptor_cpu in &placement.acceptor_cpus {
+    if let Some(&acceptor_cpu) = placement.acceptor_cpus.first() {
         let raft_listen_addr = config.raft_listen_addr.clone();
         let peers = config.peers.clone();
-        let raft_tx = raft_txs[0].clone();
-        let outbound_rx = raft_outbound_rxs[0].clone();
-        let raft_eventfd = raft_eventfds[0];
+        let raft_txs_by_group: HashMap<_, _> = placement
+            .shard_assignments
+            .iter()
+            .enumerate()
+            .map(|(idx, assignment)| (assignment.shard_id, raft_txs[idx].clone()))
+            .collect();
+        let raft_eventfds_by_group: HashMap<_, _> = placement
+            .shard_assignments
+            .iter()
+            .enumerate()
+            .map(|(idx, assignment)| (assignment.shard_id, raft_eventfds[idx]))
+            .collect();
+        let outbound_rxs = raft_outbound_rxs.clone();
 
         let handle = thread::Builder::new()
             .name("peer-transport".to_string())
@@ -144,8 +163,13 @@ pub fn start(config: ServerConfig, placement: ShardPlacement) {
                     let listener = monoio::net::TcpListener::bind(&raft_listen_addr)
                         .expect("failed to bind raft listener");
                     tracing::info!(addr = %raft_listen_addr, "raft peer listener");
-                    let transport =
-                        PeerTransport::new(listener, peers, raft_tx, raft_eventfd, outbound_rx);
+                    let transport = PeerTransport::new(
+                        listener,
+                        peers,
+                        raft_txs_by_group,
+                        raft_eventfds_by_group,
+                        outbound_rxs,
+                    );
                     transport.run().await;
                 });
             })

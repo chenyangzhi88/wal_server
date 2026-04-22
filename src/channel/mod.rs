@@ -18,11 +18,13 @@ pub struct ShardResponse {
 
 /// Message from peer transport -> shard raft state machine.
 pub struct RaftInbound {
+    pub group_id: u16,
     pub message: Message,
 }
 
 /// Message from shard raft state machine -> peer transport.
 pub struct RaftOutbound {
+    pub group_id: u16,
     pub target_id: u64,
     pub message: Message,
 }
@@ -83,9 +85,13 @@ impl Drop for ShardMailbox {
     }
 }
 
-pub fn encode_raft_message(message: &Message) -> Result<Vec<u8>, protobuf::ProtobufError> {
+pub fn encode_raft_message(
+    group_id: u16,
+    message: &Message,
+) -> Result<Vec<u8>, protobuf::ProtobufError> {
     let body = message.write_to_bytes()?;
-    let mut frame = Vec::with_capacity(4 + body.len());
+    let mut frame = Vec::with_capacity(2 + 4 + body.len());
+    frame.extend_from_slice(&group_id.to_be_bytes());
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
     Ok(frame)
@@ -93,16 +99,17 @@ pub fn encode_raft_message(message: &Message) -> Result<Vec<u8>, protobuf::Proto
 
 pub fn try_decode_raft_message(
     buf: &[u8],
-) -> Result<Option<(Message, usize)>, protobuf::ProtobufError> {
-    if buf.len() < 4 {
+) -> Result<Option<(u16, Message, usize)>, protobuf::ProtobufError> {
+    if buf.len() < 6 {
         return Ok(None);
     }
-    let len = u32::from_be_bytes(buf[0..4].try_into().expect("slice length")) as usize;
-    if buf.len() < 4 + len {
+    let group_id = u16::from_be_bytes(buf[0..2].try_into().expect("slice length"));
+    let len = u32::from_be_bytes(buf[2..6].try_into().expect("slice length")) as usize;
+    if buf.len() < 6 + len {
         return Ok(None);
     }
-    let msg = Message::parse_from_bytes(&buf[4..4 + len])?;
-    Ok(Some((msg, 4 + len)))
+    let msg = Message::parse_from_bytes(&buf[6..6 + len])?;
+    Ok(Some((group_id, msg, 6 + len)))
 }
 
 fn create_eventfd() -> std::io::Result<i32> {

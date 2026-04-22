@@ -92,6 +92,15 @@ impl StreamStateTable {
         Ok(stream_lsn)
     }
 
+    pub fn rollback_uncommitted_append(&mut self, stream_id: StreamId, stream_lsn: u64) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            let expected_next = stream_lsn.saturating_add(1);
+            if state.next_stream_lsn == expected_next && state.commit_stream_lsn <= stream_lsn {
+                state.next_stream_lsn = stream_lsn;
+            }
+        }
+    }
+
     pub fn mark_appended(
         &mut self,
         stream_id: StreamId,
